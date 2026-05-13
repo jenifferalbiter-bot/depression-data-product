@@ -1,5 +1,7 @@
 import re
 from pathlib import Path
+from io import BytesIO
+import zipfile
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -117,6 +119,38 @@ def validate_model_inputs(df, text_column, label_column):
     return True, "Inputs are valid."
 
 
+def fig_to_png_bytes(fig):
+    """
+    Convert a matplotlib figure to PNG bytes for downloading.
+    """
+    img_buffer = BytesIO()
+    fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=300)
+    img_buffer.seek(0)
+    return img_buffer
+
+
+def create_plots_zip():
+    """
+    Create a ZIP file containing all available plot images.
+    """
+    zip_buffer = BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        plot_files = {
+            "class_distribution_plot.png": st.session_state.get("class_distribution_fig"),
+            "text_length_distribution_plot.png": st.session_state.get("text_length_fig"),
+            "confusion_matrix_plot.png": st.session_state.get("confusion_matrix_fig"),
+        }
+
+        for filename, fig in plot_files.items():
+            if fig is not None:
+                img_buffer = fig_to_png_bytes(fig)
+                zip_file.writestr(filename, img_buffer.getvalue())
+
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
 def train_single_post_model():
     """
     Train a separate model for single-post prediction using a post-level labeled dataset.
@@ -169,6 +203,8 @@ Data Analysis Methods:
 - Single-post prediction using a separate post-level model
 - Probability scoring for single-post predictions
 - Accuracy, precision, recall, F1-score, and confusion matrix evaluation
+- Exportable plots in PNG format
+- Combined plot export in ZIP format
 
 Accuracy:
 {accuracy}
@@ -178,6 +214,12 @@ Classification Report:
 
 Confusion Matrix:
 {cm}
+
+Exportable Reports and Plots:
+The application allows users to download the model report as a TXT file. It also allows users
+to export generated plots, including the class distribution plot, text length distribution plot,
+and confusion matrix plot, as PNG image files. Available plots can also be downloaded together
+as a ZIP file.
 
 Single-Post Prediction:
 The application includes a Predict New Post feature that allows users to enter one social media
@@ -276,6 +318,15 @@ elif section == "Explore Data":
             ax.set_xlabel("Label")
             ax.set_ylabel("Count")
             st.pyplot(fig)
+
+            st.session_state["class_distribution_fig"] = fig
+
+            st.download_button(
+                label="Download Class Distribution Plot as PNG",
+                data=fig_to_png_bytes(fig),
+                file_name="class_distribution_plot.png",
+                mime="image/png"
+            )
         else:
             st.warning("No `label` column found.")
 
@@ -289,6 +340,15 @@ elif section == "Explore Data":
             ax.set_xlabel("Number of Characters")
             ax.set_ylabel("Frequency")
             st.pyplot(fig)
+
+            st.session_state["text_length_fig"] = fig
+
+            st.download_button(
+                label="Download Text Length Distribution Plot as PNG",
+                data=fig_to_png_bytes(fig),
+                file_name="text_length_distribution_plot.png",
+                mime="image/png"
+            )
         else:
             st.warning("No `post_text` column found.")
     else:
@@ -413,6 +473,15 @@ elif section == "Run Model":
                     ax.set_title("Confusion Matrix")
                     st.pyplot(fig)
 
+                    st.session_state["confusion_matrix_fig"] = fig
+
+                    st.download_button(
+                        label="Download Confusion Matrix Plot as PNG",
+                        data=fig_to_png_bytes(fig),
+                        file_name="confusion_matrix_plot.png",
+                        mime="image/png"
+                    )
+
                 except Exception as e:
                     st.error(f"Model error: {e}")
     else:
@@ -497,6 +566,47 @@ elif section == "Generate Report":
             file_name="depression_data_product_report.txt",
             mime="text/plain"
         )
+
+        st.subheader("Download Available Plots")
+
+        if (
+            "class_distribution_fig" in st.session_state
+            or "text_length_fig" in st.session_state
+            or "confusion_matrix_fig" in st.session_state
+        ):
+            st.download_button(
+                label="Download All Available Plots as ZIP",
+                data=create_plots_zip(),
+                file_name="depression_data_product_plots.zip",
+                mime="application/zip"
+            )
+
+            if "class_distribution_fig" in st.session_state:
+                st.download_button(
+                    label="Download Class Distribution Plot as PNG",
+                    data=fig_to_png_bytes(st.session_state["class_distribution_fig"]),
+                    file_name="class_distribution_plot.png",
+                    mime="image/png"
+                )
+
+            if "text_length_fig" in st.session_state:
+                st.download_button(
+                    label="Download Text Length Distribution Plot as PNG",
+                    data=fig_to_png_bytes(st.session_state["text_length_fig"]),
+                    file_name="text_length_distribution_plot.png",
+                    mime="image/png"
+                )
+
+            if "confusion_matrix_fig" in st.session_state:
+                st.download_button(
+                    label="Download Confusion Matrix Plot as PNG",
+                    data=fig_to_png_bytes(st.session_state["confusion_matrix_fig"]),
+                    file_name="confusion_matrix_plot.png",
+                    mime="image/png"
+                )
+        else:
+            st.info("Explore the data or run the model first to generate downloadable plots.")
+
     else:
         st.warning("Please run the model first before generating a report.")
 
@@ -516,6 +626,7 @@ elif section == "Help":
 6. Use Run Model to train and evaluate the Logistic Regression model.
 7. Use Predict New Post to enter a single social media post and view the prediction probabilities.
 8. Use Generate Report to create and download the model report.
+9. Download individual plots as PNG files or download all available plots together as a ZIP file.
 """)
 
     st.subheader("Required Dataset Columns")
@@ -528,12 +639,20 @@ Recommended columns for the main dataset:
     st.subheader("Function Descriptions")
     st.write("""
 - Upload Data: Loads the default or uploaded CSV dataset.
-- Explore Data: Displays dataset structure, missing values, and visual summaries.
+- Explore Data: Displays dataset structure, missing values, class distribution, and text length visualizations.
 - Preprocess Text: Cleans text by lowercasing and removing punctuation or numbers.
 - Run Model: Uses TF-IDF and Logistic Regression to classify text from the uploaded/default dataset.
 - Predict New Post: Uses a separate post-level model to classify one user-entered social media post.
-- Generate Report: Saves model results to a downloadable text file.
+- Generate Report: Saves model results to a downloadable text file and allows generated plots to be exported.
 - Help: Explains how to use the product.
+""")
+
+    st.subheader("Report and Plot Export")
+    st.write("""
+The app supports exporting the model report as a TXT file. It also supports exporting generated
+visualizations as PNG image files. Available plots include the class distribution plot, text length
+distribution plot, and confusion matrix plot. Users can also download all available plots together
+as a ZIP file.
 """)
 
     st.subheader("Security and Privacy")
