@@ -14,23 +14,17 @@ from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
-    ConfusionMatrixDisplay
+    ConfusionMatrixDisplay,
+    roc_curve,
+    auc,
+    RocCurveDisplay
 )
 
-# Configure the Streamlit page layout and browser tab title.
 st.set_page_config(page_title="Depression Text Data Product", layout="wide")
 
 
-# Helper functions
-
 def find_default_csv():
-    """
-    Search for a default CSV dataset that can be loaded automatically.
-    """
-    search_paths = [
-        Path("."),
-        Path("Depression dataset")
-    ]
+    search_paths = [Path("."), Path("Depression dataset")]
 
     for folder in search_paths:
         if folder.exists():
@@ -42,9 +36,6 @@ def find_default_csv():
 
 
 def load_data(uploaded_file=None):
-    """
-    Load the dataset from either a user-uploaded CSV file or a default CSV file.
-    """
     try:
         if uploaded_file is not None:
             return pd.read_csv(uploaded_file), "Uploaded file"
@@ -61,18 +52,12 @@ def load_data(uploaded_file=None):
 
 
 def get_default_column(columns, preferred_name):
-    """
-    Select a default column index for Streamlit dropdown menus.
-    """
     if preferred_name in columns:
         return list(columns).index(preferred_name)
     return 0
 
 
 def clean_text_series(series, lowercase=True, punctuation=True, numbers=True):
-    """
-    Clean a text column using selected NLP preprocessing steps.
-    """
     cleaned = series.astype(str)
 
     if lowercase:
@@ -88,9 +73,6 @@ def clean_text_series(series, lowercase=True, punctuation=True, numbers=True):
 
 
 def validate_model_inputs(df, text_column, label_column):
-    """
-    Validate selected text and label columns before model training.
-    """
     if text_column == label_column:
         return False, "The text column and label column cannot be the same."
 
@@ -120,9 +102,6 @@ def validate_model_inputs(df, text_column, label_column):
 
 
 def fig_to_png_bytes(fig):
-    """
-    Convert a matplotlib figure to PNG bytes for downloading.
-    """
     img_buffer = BytesIO()
     fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=300)
     img_buffer.seek(0)
@@ -130,9 +109,6 @@ def fig_to_png_bytes(fig):
 
 
 def create_plots_zip():
-    """
-    Create a ZIP file containing all available plot images.
-    """
     zip_buffer = BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "w") as zip_file:
@@ -140,6 +116,7 @@ def create_plots_zip():
             "class_distribution_plot.png": st.session_state.get("class_distribution_fig"),
             "text_length_distribution_plot.png": st.session_state.get("text_length_fig"),
             "confusion_matrix_plot.png": st.session_state.get("confusion_matrix_fig"),
+            "roc_curve_plot.png": st.session_state.get("roc_curve_fig"),
         }
 
         for filename, fig in plot_files.items():
@@ -152,20 +129,10 @@ def create_plots_zip():
 
 
 def train_single_post_model():
-    """
-    Train a separate model for single-post prediction using a post-level labeled dataset.
-
-    The main Twitter dataset is used for the main product workflow. This separate Reddit
-    severity dataset is used only for individual text prediction because it contains post-level
-    severity labels.
-    """
     url = "https://raw.githubusercontent.com/usmaann/Depression_Severity_Dataset/main/Reddit_depression_dataset.csv"
 
     df_single = pd.read_csv(url)
 
-    # Convert severity labels into binary labels:
-    # minimum = non-depression-related
-    # mild/moderate = depression-related
     df_single["label_binary"] = df_single["label"].apply(
         lambda x: 0 if x == "minimum" else 1
     )
@@ -184,10 +151,7 @@ def train_single_post_model():
     return model, vectorizer
 
 
-def generate_report(accuracy, report_text, cm):
-    """
-    Generate a downloadable text report summarizing model results.
-    """
+def generate_report(accuracy, report_text, cm, roc_auc_score=None):
     return f"""
 Depression-Related Language Detection Data Product Report
 
@@ -202,12 +166,15 @@ Data Analysis Methods:
 - Logistic Regression classification
 - Single-post prediction using a separate post-level model
 - Probability scoring for single-post predictions
-- Accuracy, precision, recall, F1-score, and confusion matrix evaluation
+- Accuracy, precision, recall, F1-score, confusion matrix, and ROC-AUC evaluation
 - Exportable plots in PNG format
 - Combined plot export in ZIP format
 
 Accuracy:
 {accuracy}
+
+ROC-AUC:
+{roc_auc_score}
 
 Classification Report:
 {report_text}
@@ -218,8 +185,8 @@ Confusion Matrix:
 Exportable Reports and Plots:
 The application allows users to download the model report as a TXT file. It also allows users
 to export generated plots, including the class distribution plot, text length distribution plot,
-and confusion matrix plot, as PNG image files. Available plots can also be downloaded together
-as a ZIP file.
+confusion matrix plot, and ROC curve plot, as PNG image files. Available plots can also be
+downloaded together as a ZIP file.
 
 Single-Post Prediction:
 The application includes a Predict New Post feature that allows users to enter one social media
@@ -241,8 +208,6 @@ in the Predict New Post section to view a model prediction and probability score
 """
 
 
-# Application title and overview
-
 st.title("Depression-Related Language Detection Data Product")
 
 st.write(
@@ -251,8 +216,6 @@ st.write(
     "This tool is for educational analysis only and is not a clinical diagnosis tool."
 )
 
-
-# Sidebar navigation and dataset loading
 
 st.sidebar.header("Navigation")
 section = st.sidebar.radio(
@@ -271,7 +234,6 @@ section = st.sidebar.radio(
 st.sidebar.header("Dataset")
 uploaded_file = st.sidebar.file_uploader("Optional: Upload CSV file", type=["csv"])
 
-# Load either the uploaded dataset or a default CSV file.
 df, data_source = load_data(uploaded_file)
 
 if df is not None:
@@ -279,8 +241,6 @@ if df is not None:
 else:
     st.sidebar.warning("No dataset found. Upload a CSV file or place one in the project folder.")
 
-
-# Upload Data section
 
 if section == "Upload Data":
     st.header("Upload Data")
@@ -294,8 +254,6 @@ if section == "Upload Data":
     else:
         st.info("Upload a CSV file or place your dataset CSV in the same folder as app.py.")
 
-
-# Explore Data section
 
 elif section == "Explore Data":
     st.header("Explore Data")
@@ -355,8 +313,6 @@ elif section == "Explore Data":
         st.info("Please load a dataset first.")
 
 
-# Preprocess Text section
-
 elif section == "Preprocess Text":
     st.header("Preprocess Text")
 
@@ -386,8 +342,6 @@ elif section == "Preprocess Text":
     else:
         st.info("Please load a dataset first.")
 
-
-# Run Model section
 
 elif section == "Run Model":
     st.header("Run Model")
@@ -450,6 +404,10 @@ elif section == "Run Model":
 
                     y_pred = model.predict(X_test_tfidf)
 
+                    y_prob = model.predict_proba(X_test_tfidf)[:, 1]
+                    fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+                    roc_auc_score = auc(fpr, tpr)
+
                     accuracy = accuracy_score(y_test, y_pred)
                     report = classification_report(y_test, y_pred)
                     cm = confusion_matrix(y_test, y_pred)
@@ -457,6 +415,9 @@ elif section == "Run Model":
                     st.session_state["accuracy"] = accuracy
                     st.session_state["report"] = report
                     st.session_state["cm"] = cm
+                    st.session_state["roc_auc_score"] = roc_auc_score
+                    st.session_state["fpr"] = fpr
+                    st.session_state["tpr"] = tpr
 
                     st.success("Model trained successfully.")
 
@@ -482,13 +443,34 @@ elif section == "Run Model":
                         mime="image/png"
                     )
 
+                    st.subheader("ROC-AUC Score")
+                    st.write(round(roc_auc_score, 3))
+
+                    st.subheader("ROC Curve")
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    roc_display = RocCurveDisplay(
+                        fpr=fpr,
+                        tpr=tpr,
+                        roc_auc=roc_auc_score
+                    )
+                    roc_display.plot(ax=ax)
+                    ax.set_title("ROC Curve")
+                    st.pyplot(fig)
+
+                    st.session_state["roc_curve_fig"] = fig
+
+                    st.download_button(
+                        label="Download ROC Curve Plot as PNG",
+                        data=fig_to_png_bytes(fig),
+                        file_name="roc_curve_plot.png",
+                        mime="image/png"
+                    )
+
                 except Exception as e:
                     st.error(f"Model error: {e}")
     else:
         st.info("Please load a dataset first.")
 
-
-# Predict New Post section
 
 elif section == "Predict New Post":
     st.header("Predict New Social Media Post")
@@ -503,7 +485,6 @@ elif section == "Predict New Post":
         "This feature is for educational analysis only and should not be used as a clinical diagnosis."
     )
 
-    # Train and store the separate single-post model once per Streamlit session.
     if "single_post_model" not in st.session_state or "single_post_vectorizer" not in st.session_state:
         try:
             with st.spinner("Loading single-post prediction model..."):
@@ -546,8 +527,6 @@ elif section == "Predict New Post":
             )
 
 
-# Generate Report section
-
 elif section == "Generate Report":
     st.header("Generate Report")
 
@@ -555,7 +534,8 @@ elif section == "Generate Report":
         report_text = generate_report(
             round(st.session_state["accuracy"], 3),
             st.session_state["report"],
-            st.session_state["cm"]
+            st.session_state["cm"],
+            round(st.session_state.get("roc_auc_score", 0), 3)
         )
 
         st.text_area("Generated Report", report_text, height=400)
@@ -573,6 +553,7 @@ elif section == "Generate Report":
             "class_distribution_fig" in st.session_state
             or "text_length_fig" in st.session_state
             or "confusion_matrix_fig" in st.session_state
+            or "roc_curve_fig" in st.session_state
         ):
             st.download_button(
                 label="Download All Available Plots as ZIP",
@@ -604,14 +585,20 @@ elif section == "Generate Report":
                     file_name="confusion_matrix_plot.png",
                     mime="image/png"
                 )
+
+            if "roc_curve_fig" in st.session_state:
+                st.download_button(
+                    label="Download ROC Curve Plot as PNG",
+                    data=fig_to_png_bytes(st.session_state["roc_curve_fig"]),
+                    file_name="roc_curve_plot.png",
+                    mime="image/png"
+                )
         else:
             st.info("Explore the data or run the model first to generate downloadable plots.")
 
     else:
         st.warning("Please run the model first before generating a report.")
 
-
-# Help section
 
 elif section == "Help":
     st.header("Help")
@@ -651,8 +638,8 @@ Recommended columns for the main dataset:
     st.write("""
 The app supports exporting the model report as a TXT file. It also supports exporting generated
 visualizations as PNG image files. Available plots include the class distribution plot, text length
-distribution plot, and confusion matrix plot. Users can also download all available plots together
-as a ZIP file.
+distribution plot, confusion matrix plot, and ROC curve plot. Users can also download all available
+plots together as a ZIP file.
 """)
 
     st.subheader("Security and Privacy")
