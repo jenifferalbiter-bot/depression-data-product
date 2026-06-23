@@ -1,15 +1,24 @@
+# Updated Advanced Analysis Version
+# Adds: ROC-AUC, Precision-Recall Curve, Cross-Validation, Sensitivity/Specificity,
+# Threshold Analysis, Calibration Curve, Baseline Model Comparison,
+# Iterative Refinement Comparison, and Feature Importance.
+
 import re
 from pathlib import Path
-from io import BytesIO
-import zipfile
 
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -17,11 +26,22 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
     roc_curve,
     auc,
-    RocCurveDisplay
+    RocCurveDisplay,
+    precision_recall_curve,
+    average_precision_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    make_scorer
 )
 
 st.set_page_config(page_title="Depression Text Data Product", layout="wide")
 
+
+# -------------------------
+# Helper Functions
+# -------------------------
 
 def find_default_csv():
     search_paths = [Path("."), Path("Depression dataset")]
@@ -63,11 +83,16 @@ def clean_text_series(series, lowercase=True, punctuation=True, numbers=True):
     if lowercase:
         cleaned = cleaned.str.lower()
 
+    cleaned = cleaned.apply(lambda x: re.sub(r"http\S+|www\S+", "", x))
+    cleaned = cleaned.apply(lambda x: re.sub(r"@\w+", "", x))
+
     if punctuation:
         cleaned = cleaned.apply(lambda x: re.sub(r"[^\w\s]", "", x))
 
     if numbers:
         cleaned = cleaned.apply(lambda x: re.sub(r"\d+", "", x))
+
+    cleaned = cleaned.apply(lambda x: re.sub(r"\s+", " ", x).strip())
 
     return cleaned
 
@@ -101,31 +126,172 @@ def validate_model_inputs(df, text_column, label_column):
     return True, "Inputs are valid."
 
 
-def fig_to_png_bytes(fig):
-    img_buffer = BytesIO()
-    fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=300)
-    img_buffer.seek(0)
-    return img_buffer
+def get_positive_class(y):
+    labels = sorted(pd.Series(y).dropna().unique())
+    if 1 in labels:
+        return 1
+    return labels[-1]
 
 
-def create_plots_zip():
-    zip_buffer = BytesIO()
+def get_positive_probability(model, X_test_tfidf, positive_class):
+    class_list = list(model.classes_)
+    positive_index = class_list.index(positive_class)
+    return model.predict_proba(X_test_tfidf)[:, positive_index]
 
-    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-        plot_files = {
-            "class_distribution_plot.png": st.session_state.get("class_distribution_fig"),
-            "text_length_distribution_plot.png": st.session_state.get("text_length_fig"),
-            "confusion_matrix_plot.png": st.session_state.get("confusion_matrix_fig"),
-            "roc_curve_plot.png": st.session_state.get("roc_curve_fig"),
-        }
 
-        for filename, fig in plot_files.items():
-            if fig is not None:
-                img_buffer = fig_to_png_bytes(fig)
-                zip_file.writestr(filename, img_buffer.getvalue())
+def binary_y(y, positive_class):
+    return np.array([1 if value == positive_class else 0 for value in y])
 
-    zip_buffer.seek(0)
-    return zip_buffer
+
+def calculate_advanced_metrics(y_test, y_pred, y_prob, positive_class):
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    sensitivity = tp / (tp + fn)
+    specificity = tn / (tn + fp)
+
+    y_test_binary = binary_y(y_test, positive_class)
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred, pos_label=positive_class),
+        "recall": recall_score(y_test, y_pred, pos_label=positive_class),
+        "f1": f1_score(y_test, y_pred, pos_label=positive_class),
+        "roc_auc": roc_auc_score(y_test_binary, y_prob),
+        "sensitivity": sensitivity,
+        "specificity": specificity
+    }
+
+    return metrics
+
+
+def evaluate_thresholds(y_test, y_prob, positive_class):
+    y_test_binary = binary_y(y_test, positive_class)
+
+    threshold_results = []
+
+    for threshold in [0.30, 0.40, 0.50, 0.60, 0.70]:
+        y_pred_threshold = np.where(y_prob >= threshold, 1, 0)
+
+        threshold_results.append({
+            "Threshold": threshold,
+            "Precision": precision_score(y_test_binary, y_pred_threshold, zero_division=0),
+            "Recall": recall_score(y_test_binary, y_pred_threshold, zero_division=0),
+            "F1 Score": f1_score(y_test_binary, y_pred_threshold, zero_division=0),
+            "False Positives": confusion_matrix(y_test_binary, y_pred_threshold).ravel()[1],
+            "False Negatives": confusion_matrix(y_test_binary, y_pred_threshold).ravel()[2]
+        })
+
+    return pd.DataFrame(threshold_results)
+
+
+def run_cross_validation(X, y, positive_class):
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(stop_words="english", max_features=5000)),
+        ("model", LogisticRegression(max_iter=1000))
+    ])
+
+    scorer = make_scorer(f1_score, pos_label=positive_class)
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=15)
+
+    scores = cross_val_score(
+        pipeline,
+        X,
+        y,
+        cv=cv,
+        scoring=scorer
+    )
+
+    return scores
+
+
+def compare_baseline_models(X_train, X_test, y_train, y_test, positive_class):
+    models = {
+        "Naive Bayes": MultinomialNB(),
+        "Linear SVM": LinearSVC(),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=15),
+        "Logistic Regression": LogisticRegression(max_iter=1000)
+    }
+
+    results = []
+
+    vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
+    X_train_tfidf = vectorizer.fit_transform(X_train)
+    X_test_tfidf = vectorizer.transform(X_test)
+
+    y_test_binary = binary_y(y_test, positive_class)
+
+    for name, model in models.items():
+        model.fit(X_train_tfidf, y_train)
+        y_pred = model.predict(X_test_tfidf)
+
+        if hasattr(model, "predict_proba"):
+            y_score = get_positive_probability(model, X_test_tfidf, positive_class)
+        else:
+            y_score = model.decision_function(X_test_tfidf)
+
+        results.append({
+            "Model": name,
+            "Accuracy": accuracy_score(y_test, y_pred),
+            "Precision": precision_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "Recall": recall_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "F1 Score": f1_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "ROC-AUC": roc_auc_score(y_test_binary, y_score)
+        })
+
+    return pd.DataFrame(results)
+
+
+def compare_refinements(X_train, X_test, y_train, y_test, positive_class):
+    refinements = {
+        "Baseline: 5,000 unigrams": TfidfVectorizer(stop_words="english", max_features=5000),
+        "Refinement 1: 10,000 unigrams": TfidfVectorizer(stop_words="english", max_features=10000),
+        "Refinement 2: 10,000 unigrams + bigrams": TfidfVectorizer(
+            stop_words="english",
+            max_features=10000,
+            ngram_range=(1, 2)
+        )
+    }
+
+    results = []
+    y_test_binary = binary_y(y_test, positive_class)
+
+    for name, vectorizer in refinements.items():
+        X_train_tfidf = vectorizer.fit_transform(X_train)
+        X_test_tfidf = vectorizer.transform(X_test)
+
+        model = LogisticRegression(max_iter=1000)
+        model.fit(X_train_tfidf, y_train)
+
+        y_pred = model.predict(X_test_tfidf)
+        y_prob = get_positive_probability(model, X_test_tfidf, positive_class)
+
+        results.append({
+            "Iteration": name,
+            "Accuracy": accuracy_score(y_test, y_pred),
+            "Precision": precision_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "Recall": recall_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "F1 Score": f1_score(y_test, y_pred, pos_label=positive_class, zero_division=0),
+            "ROC-AUC": roc_auc_score(y_test_binary, y_prob)
+        })
+
+    return pd.DataFrame(results)
+
+
+def plot_feature_importance(model, vectorizer, top_n=20):
+    feature_names = vectorizer.get_feature_names_out()
+    coefficients = model.coef_[0]
+
+    importance_df = pd.DataFrame({
+        "Feature": feature_names,
+        "Coefficient": coefficients
+    })
+
+    top_positive = importance_df.sort_values("Coefficient", ascending=False).head(top_n)
+    top_negative = importance_df.sort_values("Coefficient", ascending=True).head(top_n)
+
+    return top_positive, top_negative
 
 
 def train_single_post_model():
@@ -151,7 +317,58 @@ def train_single_post_model():
     return model, vectorizer
 
 
-def generate_report(accuracy, report_text, cm, roc_auc_score=None):
+def generate_report(
+    accuracy,
+    report_text,
+    cm,
+    roc_auc_score=None,
+    advanced_metrics=None,
+    cv_scores=None,
+    threshold_results=None,
+    baseline_results=None,
+    refinement_results=None
+):
+    advanced_text = ""
+    if advanced_metrics is not None:
+        advanced_text = f"""
+Advanced Metrics:
+Precision: {advanced_metrics.get("precision")}
+Recall: {advanced_metrics.get("recall")}
+F1 Score: {advanced_metrics.get("f1")}
+Sensitivity: {advanced_metrics.get("sensitivity")}
+Specificity: {advanced_metrics.get("specificity")}
+"""
+
+    cv_text = ""
+    if cv_scores is not None:
+        cv_text = f"""
+Cross-Validation Results:
+Fold Scores: {cv_scores}
+Mean F1 Score: {np.mean(cv_scores)}
+Standard Deviation: {np.std(cv_scores)}
+"""
+
+    threshold_text = ""
+    if threshold_results is not None:
+        threshold_text = f"""
+Threshold Analysis:
+{threshold_results.to_string(index=False)}
+"""
+
+    baseline_text = ""
+    if baseline_results is not None:
+        baseline_text = f"""
+Baseline Model Comparison:
+{baseline_results.to_string(index=False)}
+"""
+
+    refinement_text = ""
+    if refinement_results is not None:
+        refinement_text = f"""
+Iterative Refinement Comparison:
+{refinement_results.to_string(index=False)}
+"""
+
     return f"""
 Depression-Related Language Detection Data Product Report
 
@@ -166,9 +383,9 @@ Data Analysis Methods:
 - Logistic Regression classification
 - Single-post prediction using a separate post-level model
 - Probability scoring for single-post predictions
-- Accuracy, precision, recall, F1-score, confusion matrix, and ROC-AUC evaluation
-- Exportable plots in PNG format
-- Combined plot export in ZIP format
+- Accuracy, precision, recall, F1-score, confusion matrix, ROC-AUC, precision-recall analysis,
+  sensitivity, specificity, cross-validation, threshold analysis, calibration analysis,
+  baseline model comparison, and iterative refinement evaluation
 
 Accuracy:
 {accuracy}
@@ -182,31 +399,39 @@ Classification Report:
 Confusion Matrix:
 {cm}
 
-Exportable Reports and Plots:
-The application allows users to download the model report as a TXT file. It also allows users
-to export generated plots, including the class distribution plot, text length distribution plot,
-confusion matrix plot, and ROC curve plot, as PNG image files. Available plots can also be
-downloaded together as a ZIP file.
+{advanced_text}
+
+{cv_text}
+
+{threshold_text}
+
+{baseline_text}
+
+{refinement_text}
 
 Single-Post Prediction:
 The application includes a Predict New Post feature that allows users to enter one social media
 post and receive a model prediction. This feature displays probability scores for both classes:
-non-depression-related language and depression-related language. These probability scores help
-users interpret model confidence in addition to the predicted class.
+non-depression-related language and depression-related language.
 
 Security and Privacy:
 - The app does not require names, usernames, passwords, or personal identifiers.
+- URLs and usernames are removed during text preprocessing.
 - The dataset is processed only during the active app session.
 - User-entered text is analyzed only during the active app session.
 - The app is intended for educational and research analysis only.
 - The app is not a clinical diagnosis tool.
 
-Help:
-Users can upload a CSV file or use the default dataset. The required columns are a text column
-such as post_text and a label column such as label. Users may also enter one social media post
-in the Predict New Post section to view a model prediction and probability scores.
+Responsible AI Statement:
+Because this model analyzes sensitive mental-health-related language, results should be interpreted
+with caution. The model should support research and educational analysis only. It should not be used
+to diagnose individuals, replace clinical judgment, or make automated decisions about care.
 """
 
+
+# -------------------------
+# App Layout
+# -------------------------
 
 st.title("Depression-Related Language Detection Data Product")
 
@@ -215,7 +440,6 @@ st.write(
     "TF-IDF feature extraction, and Logistic Regression to identify depression-related language patterns. "
     "This tool is for educational analysis only and is not a clinical diagnosis tool."
 )
-
 
 st.sidebar.header("Navigation")
 section = st.sidebar.radio(
@@ -242,6 +466,10 @@ else:
     st.sidebar.warning("No dataset found. Upload a CSV file or place one in the project folder.")
 
 
+# -------------------------
+# Upload Data
+# -------------------------
+
 if section == "Upload Data":
     st.header("Upload Data")
 
@@ -254,6 +482,10 @@ if section == "Upload Data":
     else:
         st.info("Upload a CSV file or place your dataset CSV in the same folder as app.py.")
 
+
+# -------------------------
+# Explore Data
+# -------------------------
 
 elif section == "Explore Data":
     st.header("Explore Data")
@@ -276,15 +508,6 @@ elif section == "Explore Data":
             ax.set_xlabel("Label")
             ax.set_ylabel("Count")
             st.pyplot(fig)
-
-            st.session_state["class_distribution_fig"] = fig
-
-            st.download_button(
-                label="Download Class Distribution Plot as PNG",
-                data=fig_to_png_bytes(fig),
-                file_name="class_distribution_plot.png",
-                mime="image/png"
-            )
         else:
             st.warning("No `label` column found.")
 
@@ -299,19 +522,32 @@ elif section == "Explore Data":
             ax.set_ylabel("Frequency")
             st.pyplot(fig)
 
-            st.session_state["text_length_fig"] = fig
+            if "label" in df.columns:
+                st.subheader("Average Text Length by Class")
+                length_df = pd.DataFrame({
+                    "label": df["label"],
+                    "text_length": text_length
+                })
 
-            st.download_button(
-                label="Download Text Length Distribution Plot as PNG",
-                data=fig_to_png_bytes(fig),
-                file_name="text_length_distribution_plot.png",
-                mime="image/png"
-            )
+                avg_length = length_df.groupby("label")["text_length"].mean().reset_index()
+                st.dataframe(avg_length)
+
+                fig, ax = plt.subplots(figsize=(8, 5))
+                avg_length.plot(kind="bar", x="label", y="text_length", legend=False, ax=ax)
+                ax.set_title("Average Text Length by Class")
+                ax.set_xlabel("Label")
+                ax.set_ylabel("Average Number of Characters")
+                st.pyplot(fig)
+
         else:
             st.warning("No `post_text` column found.")
     else:
         st.info("Please load a dataset first.")
 
+
+# -------------------------
+# Preprocess Text
+# -------------------------
 
 elif section == "Preprocess Text":
     st.header("Preprocess Text")
@@ -342,6 +578,10 @@ elif section == "Preprocess Text":
     else:
         st.info("Please load a dataset first.")
 
+
+# -------------------------
+# Run Model
+# -------------------------
 
 elif section == "Run Model":
     st.header("Run Model")
@@ -386,6 +626,7 @@ elif section == "Run Model":
 
                     X = df["clean_text"]
                     y = df[label_column]
+                    positive_class = get_positive_class(y)
 
                     X_train, X_test, y_train, y_test = train_test_split(
                         X,
@@ -403,21 +644,67 @@ elif section == "Run Model":
                     model.fit(X_train_tfidf, y_train)
 
                     y_pred = model.predict(X_test_tfidf)
+                    y_prob = get_positive_probability(model, X_test_tfidf, positive_class)
 
-                    y_prob = model.predict_proba(X_test_tfidf)[:, 1]
-                    fpr, tpr, thresholds = roc_curve(y_test, y_prob)
-                    roc_auc_score = auc(fpr, tpr)
+                    fpr, tpr, roc_thresholds = roc_curve(
+                        binary_y(y_test, positive_class),
+                        y_prob
+                    )
 
+                    roc_auc_value = auc(fpr, tpr)
                     accuracy = accuracy_score(y_test, y_pred)
                     report = classification_report(y_test, y_pred)
                     cm = confusion_matrix(y_test, y_pred)
 
+                    advanced_metrics = calculate_advanced_metrics(
+                        y_test,
+                        y_pred,
+                        y_prob,
+                        positive_class
+                    )
+
+                    precision_curve, recall_curve, pr_thresholds = precision_recall_curve(
+                        binary_y(y_test, positive_class),
+                        y_prob
+                    )
+
+                    average_precision = average_precision_score(
+                        binary_y(y_test, positive_class),
+                        y_prob
+                    )
+
+                    threshold_results = evaluate_thresholds(y_test, y_prob, positive_class)
+                    cv_scores = run_cross_validation(X, y, positive_class)
+                    baseline_results = compare_baseline_models(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        positive_class
+                    )
+                    refinement_results = compare_refinements(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        positive_class
+                    )
+
+                    top_positive, top_negative = plot_feature_importance(
+                        model,
+                        vectorizer,
+                        top_n=20
+                    )
+
                     st.session_state["accuracy"] = accuracy
                     st.session_state["report"] = report
                     st.session_state["cm"] = cm
-                    st.session_state["roc_auc_score"] = roc_auc_score
-                    st.session_state["fpr"] = fpr
-                    st.session_state["tpr"] = tpr
+                    st.session_state["roc_auc_score"] = roc_auc_value
+                    st.session_state["advanced_metrics"] = advanced_metrics
+                    st.session_state["cv_scores"] = cv_scores
+                    st.session_state["threshold_results"] = threshold_results
+                    st.session_state["baseline_results"] = baseline_results
+                    st.session_state["refinement_results"] = refinement_results
 
                     st.success("Model trained successfully.")
 
@@ -434,43 +721,133 @@ elif section == "Run Model":
                     ax.set_title("Confusion Matrix")
                     st.pyplot(fig)
 
-                    st.session_state["confusion_matrix_fig"] = fig
-
-                    st.download_button(
-                        label="Download Confusion Matrix Plot as PNG",
-                        data=fig_to_png_bytes(fig),
-                        file_name="confusion_matrix_plot.png",
-                        mime="image/png"
-                    )
-
                     st.subheader("ROC-AUC Score")
-                    st.write(round(roc_auc_score, 3))
+                    st.write(round(roc_auc_value, 3))
 
                     st.subheader("ROC Curve")
                     fig, ax = plt.subplots(figsize=(6, 6))
                     roc_display = RocCurveDisplay(
                         fpr=fpr,
                         tpr=tpr,
-                        roc_auc=roc_auc_score
+                        roc_auc=roc_auc_value
                     )
                     roc_display.plot(ax=ax)
                     ax.set_title("ROC Curve")
                     st.pyplot(fig)
 
-                    st.session_state["roc_curve_fig"] = fig
+                    st.subheader("Precision-Recall Curve")
+                    st.write(f"Average Precision Score: {average_precision:.3f}")
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.plot(recall_curve, precision_curve)
+                    ax.set_title("Precision-Recall Curve")
+                    ax.set_xlabel("Recall")
+                    ax.set_ylabel("Precision")
+                    st.pyplot(fig)
 
-                    st.download_button(
-                        label="Download ROC Curve Plot as PNG",
-                        data=fig_to_png_bytes(fig),
-                        file_name="roc_curve_plot.png",
-                        mime="image/png"
+                    st.subheader("Sensitivity and Specificity")
+                    metric_df = pd.DataFrame([{
+                        "Accuracy": advanced_metrics["accuracy"],
+                        "Precision": advanced_metrics["precision"],
+                        "Recall": advanced_metrics["recall"],
+                        "F1 Score": advanced_metrics["f1"],
+                        "ROC-AUC": advanced_metrics["roc_auc"],
+                        "Sensitivity": advanced_metrics["sensitivity"],
+                        "Specificity": advanced_metrics["specificity"]
+                    }])
+                    st.dataframe(metric_df)
+
+                    st.subheader("Cross-Validation Results")
+                    st.write("5-Fold F1 Scores:", cv_scores)
+                    st.write("Mean F1 Score:", round(cv_scores.mean(), 3))
+                    st.write("Standard Deviation:", round(cv_scores.std(), 3))
+
+                    st.subheader("Threshold Analysis")
+                    st.dataframe(threshold_results)
+
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.plot(threshold_results["Threshold"], threshold_results["Recall"], marker="o", label="Recall")
+                    ax.plot(threshold_results["Threshold"], threshold_results["Precision"], marker="o", label="Precision")
+                    ax.set_title("Threshold Impact on Precision and Recall")
+                    ax.set_xlabel("Classification Threshold")
+                    ax.set_ylabel("Score")
+                    ax.legend()
+                    st.pyplot(fig)
+
+                    st.subheader("Calibration Curve")
+                    prob_true, prob_pred = calibration_curve(
+                        binary_y(y_test, positive_class),
+                        y_prob,
+                        n_bins=10
                     )
+
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.plot(prob_pred, prob_true, marker="o")
+                    ax.plot([0, 1], [0, 1], linestyle="--")
+                    ax.set_title("Calibration Curve")
+                    ax.set_xlabel("Mean Predicted Probability")
+                    ax.set_ylabel("Fraction of Positives")
+                    st.pyplot(fig)
+
+                    st.subheader("Baseline Model Comparison")
+                    st.dataframe(baseline_results)
+
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    baseline_results.plot(kind="bar", x="Model", y="F1 Score", legend=False, ax=ax)
+                    ax.set_title("Baseline Model Comparison by F1 Score")
+                    ax.set_xlabel("Model")
+                    ax.set_ylabel("F1 Score")
+                    st.pyplot(fig)
+
+                    st.subheader("Iterative Refinement Comparison")
+                    st.dataframe(refinement_results)
+
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    refinement_results.plot(kind="bar", x="Iteration", y="F1 Score", legend=False, ax=ax)
+                    ax.set_title("Iterative Refinement Comparison by F1 Score")
+                    ax.set_xlabel("Iteration")
+                    ax.set_ylabel("F1 Score")
+                    plt.xticks(rotation=30, ha="right")
+                    st.pyplot(fig)
+
+                    st.subheader("Feature Importance: Depression-Related Language Indicators")
+                    st.dataframe(top_positive)
+
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    top_positive.sort_values("Coefficient").plot(
+                        kind="barh",
+                        x="Feature",
+                        y="Coefficient",
+                        legend=False,
+                        ax=ax
+                    )
+                    ax.set_title("Top Positive Features")
+                    ax.set_xlabel("Coefficient")
+                    st.pyplot(fig)
+
+                    st.subheader("Feature Importance: Non-Depression-Related Language Indicators")
+                    st.dataframe(top_negative)
+
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    top_negative.sort_values("Coefficient", ascending=False).plot(
+                        kind="barh",
+                        x="Feature",
+                        y="Coefficient",
+                        legend=False,
+                        ax=ax
+                    )
+                    ax.set_title("Top Negative Features")
+                    ax.set_xlabel("Coefficient")
+                    st.pyplot(fig)
 
                 except Exception as e:
                     st.error(f"Model error: {e}")
     else:
         st.info("Please load a dataset first.")
 
+
+# -------------------------
+# Predict New Post
+# -------------------------
 
 elif section == "Predict New Post":
     st.header("Predict New Social Media Post")
@@ -527,6 +904,10 @@ elif section == "Predict New Post":
             )
 
 
+# -------------------------
+# Generate Report
+# -------------------------
+
 elif section == "Generate Report":
     st.header("Generate Report")
 
@@ -535,7 +916,12 @@ elif section == "Generate Report":
             round(st.session_state["accuracy"], 3),
             st.session_state["report"],
             st.session_state["cm"],
-            round(st.session_state.get("roc_auc_score", 0), 3)
+            round(st.session_state.get("roc_auc_score", 0), 3),
+            st.session_state.get("advanced_metrics"),
+            st.session_state.get("cv_scores"),
+            st.session_state.get("threshold_results"),
+            st.session_state.get("baseline_results"),
+            st.session_state.get("refinement_results")
         )
 
         st.text_area("Generated Report", report_text, height=400)
@@ -543,62 +929,16 @@ elif section == "Generate Report":
         st.download_button(
             label="Download Report as TXT File",
             data=report_text,
-            file_name="depression_data_product_report.txt",
+            file_name="advanced_depression_model_report.txt",
             mime="text/plain"
         )
-
-        st.subheader("Download Available Plots")
-
-        if (
-            "class_distribution_fig" in st.session_state
-            or "text_length_fig" in st.session_state
-            or "confusion_matrix_fig" in st.session_state
-            or "roc_curve_fig" in st.session_state
-        ):
-            st.download_button(
-                label="Download All Available Plots as ZIP",
-                data=create_plots_zip(),
-                file_name="depression_data_product_plots.zip",
-                mime="application/zip"
-            )
-
-            if "class_distribution_fig" in st.session_state:
-                st.download_button(
-                    label="Download Class Distribution Plot as PNG",
-                    data=fig_to_png_bytes(st.session_state["class_distribution_fig"]),
-                    file_name="class_distribution_plot.png",
-                    mime="image/png"
-                )
-
-            if "text_length_fig" in st.session_state:
-                st.download_button(
-                    label="Download Text Length Distribution Plot as PNG",
-                    data=fig_to_png_bytes(st.session_state["text_length_fig"]),
-                    file_name="text_length_distribution_plot.png",
-                    mime="image/png"
-                )
-
-            if "confusion_matrix_fig" in st.session_state:
-                st.download_button(
-                    label="Download Confusion Matrix Plot as PNG",
-                    data=fig_to_png_bytes(st.session_state["confusion_matrix_fig"]),
-                    file_name="confusion_matrix_plot.png",
-                    mime="image/png"
-                )
-
-            if "roc_curve_fig" in st.session_state:
-                st.download_button(
-                    label="Download ROC Curve Plot as PNG",
-                    data=fig_to_png_bytes(st.session_state["roc_curve_fig"]),
-                    file_name="roc_curve_plot.png",
-                    mime="image/png"
-                )
-        else:
-            st.info("Explore the data or run the model first to generate downloadable plots.")
-
     else:
         st.warning("Please run the model first before generating a report.")
 
+
+# -------------------------
+# Help
+# -------------------------
 
 elif section == "Help":
     st.header("Help")
@@ -608,12 +948,12 @@ elif section == "Help":
 1. Open the app using Streamlit.
 2. The app will automatically load a default CSV dataset if one is available.
 3. If needed, upload a CSV file using the sidebar.
-4. Use Explore Data to view the dataset, missing values, class distribution, and text length.
+4. Use Explore Data to view the dataset, missing values, class distribution, text length, and average text length by class.
 5. Use Preprocess Text to clean the text data.
 6. Use Run Model to train and evaluate the Logistic Regression model.
-7. Use Predict New Post to enter a single social media post and view the prediction probabilities.
-8. Use Generate Report to create and download the model report.
-9. Download individual plots as PNG files or download all available plots together as a ZIP file.
+7. Review advanced evaluation outputs including ROC-AUC, Precision-Recall Curve, Cross-Validation, Sensitivity, Specificity, Calibration Curve, Threshold Analysis, Baseline Model Comparison, Iterative Refinement, and Feature Importance.
+8. Use Predict New Post to enter a single social media post and view prediction probabilities.
+9. Use Generate Report to create and download the model report.
 """)
 
     st.subheader("Required Dataset Columns")
@@ -623,29 +963,24 @@ Recommended columns for the main dataset:
 - `label`: contains the classification target, usually 0 or 1.
 """)
 
-    st.subheader("Function Descriptions")
+    st.subheader("Advanced Analysis Features")
     st.write("""
-- Upload Data: Loads the default or uploaded CSV dataset.
-- Explore Data: Displays dataset structure, missing values, class distribution, and text length visualizations.
-- Preprocess Text: Cleans text by lowercasing and removing punctuation or numbers.
-- Run Model: Uses TF-IDF and Logistic Regression to classify text from the uploaded/default dataset.
-- Predict New Post: Uses a separate post-level model to classify one user-entered social media post.
-- Generate Report: Saves model results to a downloadable text file and allows generated plots to be exported.
-- Help: Explains how to use the product.
-""")
-
-    st.subheader("Report and Plot Export")
-    st.write("""
-The app supports exporting the model report as a TXT file. It also supports exporting generated
-visualizations as PNG image files. Available plots include the class distribution plot, text length
-distribution plot, confusion matrix plot, and ROC curve plot. Users can also download all available
-plots together as a ZIP file.
+- ROC-AUC evaluates how well the model separates classes across thresholds.
+- Precision-Recall Curve shows the tradeoff between identifying depression-related posts and limiting false positives.
+- Sensitivity measures how well the model identifies depression-related posts.
+- Specificity measures how well the model identifies non-depression-related posts.
+- Cross-validation evaluates model stability across multiple folds.
+- Threshold analysis shows how changing the decision cutoff affects false positives and false negatives.
+- Calibration analysis evaluates whether predicted probabilities are reliable.
+- Baseline comparison compares Logistic Regression against Naive Bayes, Linear SVM, and Random Forest.
+- Iterative refinement compares the original TF-IDF setup against expanded feature settings.
+- Feature importance identifies the terms most associated with each prediction class.
 """)
 
     st.subheader("Security and Privacy")
     st.write("""
 This app does not require personal identifiers, usernames, passwords, or private information.
-The data is processed only while the app is running. User-entered text is analyzed only during
-the active app session. The product is intended for educational analysis and is not a replacement
-for clinical diagnosis or professional mental health care.
+URLs and usernames are removed during preprocessing. The data is processed only while the app is running.
+User-entered text is analyzed only during the active app session. The product is intended for educational
+analysis and is not a replacement for clinical diagnosis or professional mental health care.
 """)
